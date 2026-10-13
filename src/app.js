@@ -2,9 +2,9 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { storageFromEnv, validateRepoInput } from "./storage.js";
 import { blobsFromEnv } from "./blobs.js";
-import { mapUpstream } from "./formats.js";
+import { mapUpstream, rewriteNpmTarballs, rewritePypiHrefs, selfBaseUrl } from "./formats.js";
 import { fetchUpstream } from "./upstream.js";
-import { nowIso, ttlSec, parseN } from "./ids.js";
+import { nowIso, sha256hex, ttlSec, parseN } from "./ids.js";
 
 export function createApp(env = process.env, deps = null) {
   const app = new Hono();
@@ -60,19 +60,21 @@ export function createApp(env = process.env, deps = null) {
     return c.body(null, 204);
   });
 
-  // ---- Proxy-cache per format ----
+  // ---- Proxy-cache per format (GET downloads, HEAD metadata — Maven Wagon uses both) ----
   for (const prefix of ["npm", "pypi", "maven", "nuget", "go"]) {
-    app.get(`/${prefix}/:repo/*`, (c) => handleProxy(c, prefix));
-    app.get(`/${prefix}/:repo`, (c) => handleProxy(c, prefix));
+    app.on(["GET", "HEAD"], `/${prefix}/:repo/*`, (c) => handleProxy(c, prefix));
+    app.on(["GET", "HEAD"], `/${prefix}/:repo`, (c) => handleProxy(c, prefix));
   }
 
   async function handleProxy(c, expectedFormat) {
     const repoName = c.req.param("repo") || "";
+    const headOnly = c.req.method === "HEAD";
     // Wildcard remainder: Hono exposes it as index 0 param in some versions;
     // fall back to path slicing for portability.
-    const full = c.req.path; // e.g. /npm/myrepo/express/1.0.0
+    const full = c.req.path; // e.g. /maven/mavencentral/junit/junit/4.13.2/junit-4.13.2.pom
     const base = `/${expectedFormat}/${repoName}`;
     const subpath = full.startsWith(base) ? full.slice(base.length).replace(/^\/+/, "") : "";
+    if (!subpath) return c.json({ message: "Specify artifact path" }, 404);
     try {
       const repo = await repos.getRepo(repoName);
       if (!repo) return c.json({ message: "Repository not found" }, 404);
@@ -80,31 +82,77 @@ export function createApp(env = process.env, deps = null) {
         return c.json({ message: `Repository is format ${repo.format}, not ${expectedFormat}` }, 400);
       }
       const { key, url, contentType } = mapUpstream(repo, subpath);
+      const self = selfBaseUrl(c);
       const cached = await repos.getArtifact(key);
       if (cached?.etag) {
         const blob = await blobs.get(cached.etag);
-        if (blob) return serveBytes(c, blob.bytes, cached.contentType || contentType, cached.etag, true);
+        if (blob) {
+          const out = maybeRewriteServe(repo, expectedFormat, self, cached.contentType || contentType, blob.bytes, url);
+          if (headOnly) return serveHead(c, out.contentType, out.etag, out.bytes.byteLength, true);
+          return serveBytes(c, out.bytes, out.contentType, out.etag, true);
+        }
       }
-      const up = await fetchUpstream(url, fetchFn);
+      if (headOnly) {
+        // HEAD miss: fill cache via GET so the next GET is HIT (Maven checks HEAD first).
+        const up = await fetchUpstream(url, fetchFn, "GET");
+        if (up.status === 404 || !up.bytes) return c.json({ message: "Not found upstream" }, 404);
+        if (up.status !== 200) return c.json({ message: `Upstream error (${up.status})` }, 502);
+        const stored = await storeArtifact(repo, repoName, key, subpath, url, up);
+        const out = maybeRewriteServe(repo, expectedFormat, self, stored.contentType, up.bytes, url);
+        return serveHead(c, out.contentType, out.etag, out.bytes.byteLength, false);
+      }
+      const up = await fetchUpstream(url, fetchFn, "GET");
       if (up.status === 404 || !up.bytes) return c.json({ message: "Not found upstream" }, 404);
       if (up.status !== 200) return c.json({ message: `Upstream error (${up.status})` }, 502);
-      const { etag, size } = await blobs.put(up.bytes);
-      const entry = {
-        key,
-        repo: repoName,
-        path: subpath,
-        etag,
-        size,
-        contentType: up.contentType || contentType,
-        upstream: url,
-        createdAt: nowIso(),
-        expiresAt: ttlSec(repo.cacheTtl || 3600),
-      };
-      await repos.putArtifact(key, entry);
-      return serveBytes(c, up.bytes, entry.contentType, etag, false);
+      const stored = await storeArtifact(repo, repoName, key, subpath, url, up);
+      const out = maybeRewriteServe(repo, expectedFormat, self, stored.contentType, up.bytes, url);
+      return serveBytes(c, out.bytes, out.contentType, out.etag, false);
     } catch (e) {
       return c.json({ message: e.message || "Bad request" }, e.status || 400);
     }
+  }
+
+  async function storeArtifact(repo, repoName, key, subpath, url, up) {
+    const { etag, size } = await blobs.put(up.bytes);
+    const entry = {
+      key,
+      repo: repoName,
+      path: subpath,
+      etag,
+      size,
+      contentType: up.contentType || "application/octet-stream",
+      upstream: url,
+      createdAt: nowIso(),
+      expiresAt: ttlSec(repo.cacheTtl || 3600),
+    };
+    await repos.putArtifact(key, entry);
+    return entry;
+  }
+
+  // Serve-time rewrites (cache keeps the original upstream bytes, so the same
+  // cache works behind any hostname; ETag then reflects the served bytes):
+  // - npm metadata JSON: dist.tarball → this instance
+  // - pypi simple HTML: file hrefs → this instance (files/ reserved subpath)
+  // Anything else passes through untouched.
+  function maybeRewriteServe(repo, format, self, contentType, bytes, upstreamUrl) {
+    if (format === "npm" && String(contentType || "").includes("json")) {
+      const r = rewriteNpmTarballs(repo, self, bytes);
+      if (r.count) return { bytes: r.bytes, contentType, etag: sha256hex(r.bytes) };
+    }
+    if (format === "pypi" && String(contentType || "").includes("html")) {
+      const r = rewritePypiHrefs(repo, self, upstreamUrl, bytes);
+      if (r.count) return { bytes: r.bytes, contentType, etag: sha256hex(r.bytes) };
+    }
+    return { bytes, contentType, etag: sha256hex(bytes) };
+  }
+
+  function serveHead(c, contentType, etag, size, hit) {
+    c.header("Content-Type", contentType);
+    c.header("Content-Length", String(size ?? 0));
+    c.header("ETag", `"${etag}"`);
+    c.header("Cache-Control", "public, max-age=300");
+    c.header("X-XAR-Cache", hit ? "HIT" : "MISS");
+    return c.body(null, 200);
   }
 
   function serveBytes(c, bytes, contentType, etag, hit) {

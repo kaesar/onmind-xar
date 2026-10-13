@@ -8,6 +8,9 @@
     "dev": "bun src/dev.js",
     "start": "bun src/dev.js",
     "smoke": "bun scripts/smoke.js",
+    "live:maven": "bun scripts/live-maven.js",
+    "live:npm": "bun scripts/live-npm.js",
+    "live:pypi": "bun scripts/live-pypi.js",
     "test": "bun scripts/smoke.js"
   },
   "dependencies": {

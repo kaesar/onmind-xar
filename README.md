@@ -42,6 +42,63 @@ pip install --index-url http://localhost:8791/pypi/pypi-simple/ requests
 export GOPROXY=http://localhost:8791/go/goproxy
 ```
 
+## npm registry
+
+Drop-in mirror (verified live, `bun run live:npm`, real network vs
+`registry.npmjs.org`): metadata `MISS→HIT` with `dist.tarball` rewritten to
+`/<repo>` so `npm install` downloads tarballs **through** XAR (cache stores
+the original bytes; rewrite happens on serve, hostname-independent).
+Tarball `sha512` matches `dist.integrity`, scoped packages (`@types/node`,
+encoded `%2F`) rewritten, missing package 404. End-to-end CLI green:
+
+```bash
+npm view left-pad version --registry http://localhost:8791/npm/npmjs
+npm install left-pad@1.3.0 --registry http://localhost:8791/npm/npmjs
+```
+
+## PyPI index
+
+Drop-in mirror (verified live, `bun run live:pypi`, real network vs
+`pypi.org`): index `MISS→HIT` with file hrefs rewritten to
+`/pypi/<repo>/files/…` (reserved subpath served from
+`files.pythonhosted.org`; `#sha256=` fragments preserved so pip verifies).
+End-to-end CLI green (note `--trusted-host` for plain HTTP):
+
+```bash
+curl -s -X POST http://localhost:8791/repositories \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"pypiproxy","format":"pypi","upstream":"https://pypi.org/simple"}'
+pip download --no-deps --index-url http://localhost:8791/pypi/pypiproxy/ \
+  --trusted-host localhost six==1.16.0 -d /tmp/xar-pip
+```
+
+## Maven mirror (`~/.m2/settings.xml`)
+
+```xml
+<settings>
+  <mirrors>
+    <mirror>
+      <id>xar</id>
+      <mirrorOf>central</mirrorOf>
+      <url>http://localhost:8791/maven/mavencentral</url>
+    </mirror>
+  </mirrors>
+</settings>
+```
+
+Create the repo first (`upstream` must be the Maven2 layout root):
+
+```bash
+curl -s -X POST http://localhost:8791/repositories \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"mavencentral","format":"maven","upstream":"https://repo1.maven.org/maven2"}'
+```
+
+Verified live (`bun run live:maven`, real network vs Maven Central):
+`junit:junit:4.13.2` pom+jar MISS→HIT with stable `ETag`, `HEAD` HIT with
+empty body, `.sha1` passthrough, missing path 404. Plain `curl` flow above
+is green; full `mvn dependency:get` pending a machine with Maven installed.
+
 ## API
 
 | Method | Route | Notes |
@@ -52,6 +109,7 @@ export GOPROXY=http://localhost:8791/go/goproxy
 | `GET` | `/repositories/:name` | detail |
 | `DELETE` | `/repositories/:name` | `204` |
 | `GET` | `/npm/:repo/*`, `/pypi/:repo/*`, `/maven/:repo/*`, `/nuget/:repo/*`, `/go/:repo/*` | pull-through cache, `X-XAR-Cache: HIT\|MISS`, `ETag` |
+| `HEAD` | same proxy paths | metadata only (empty body), fills cache on MISS — Maven Wagon uses it |
 
 Auth: `x-api-key` header if `XAR_API_KEY` set (except `/health`).
 
