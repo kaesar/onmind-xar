@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { storageFromEnv, validateRepoInput } from "./storage.js";
 import { blobsFromEnv } from "./blobs.js";
-import { mapUpstream, rewriteNpmTarballs, rewritePypiHrefs, selfBaseUrl } from "./formats.js";
+import { mapUpstream, rewriteNpmTarballs, rewriteNugetUrls, rewritePypiHrefs, selfBaseUrl } from "./formats.js";
 import { fetchUpstream } from "./upstream.js";
 import { nowIso, sha256hex, ttlSec, parseN } from "./ids.js";
 
@@ -73,8 +73,12 @@ export function createApp(env = process.env, deps = null) {
     // fall back to path slicing for portability.
     const full = c.req.path; // e.g. /maven/mavencentral/junit/junit/4.13.2/junit-4.13.2.pom
     const base = `/${expectedFormat}/${repoName}`;
-    const subpath = full.startsWith(base) ? full.slice(base.length).replace(/^\/+/, "") : "";
-    if (!subpath) return c.json({ message: "Specify artifact path" }, 404);
+    let subpath = full.startsWith(base) ? full.slice(base.length).replace(/^\/+/, "") : "";
+    if (!subpath) {
+      // NuGet clients may use the repo root as the v3 source; serve the index.
+      if (expectedFormat === "nuget") subpath = "index.json";
+      else return c.json({ message: "Specify artifact path" }, 404);
+    }
     try {
       const repo = await repos.getRepo(repoName);
       if (!repo) return c.json({ message: "Repository not found" }, 404);
@@ -95,14 +99,14 @@ export function createApp(env = process.env, deps = null) {
       if (headOnly) {
         // HEAD miss: fill cache via GET so the next GET is HIT (Maven checks HEAD first).
         const up = await fetchUpstream(url, fetchFn, "GET");
-        if (up.status === 404 || !up.bytes) return c.json({ message: "Not found upstream" }, 404);
+        if (up.status === 404 || up.status === 410 || !up.bytes) return c.json({ message: "Not found upstream" }, 404);
         if (up.status !== 200) return c.json({ message: `Upstream error (${up.status})` }, 502);
         const stored = await storeArtifact(repo, repoName, key, subpath, url, up);
         const out = maybeRewriteServe(repo, expectedFormat, self, stored.contentType, up.bytes, url);
         return serveHead(c, out.contentType, out.etag, out.bytes.byteLength, false);
       }
       const up = await fetchUpstream(url, fetchFn, "GET");
-      if (up.status === 404 || !up.bytes) return c.json({ message: "Not found upstream" }, 404);
+      if (up.status === 404 || up.status === 410 || !up.bytes) return c.json({ message: "Not found upstream" }, 404);
       if (up.status !== 200) return c.json({ message: `Upstream error (${up.status})` }, 502);
       const stored = await storeArtifact(repo, repoName, key, subpath, url, up);
       const out = maybeRewriteServe(repo, expectedFormat, self, stored.contentType, up.bytes, url);
@@ -133,14 +137,20 @@ export function createApp(env = process.env, deps = null) {
   // cache works behind any hostname; ETag then reflects the served bytes):
   // - npm metadata JSON: dist.tarball → this instance
   // - pypi simple HTML: file hrefs → this instance (files/ reserved subpath)
+  // - nuget v3 JSON: service-index/registration URLs → this instance
   // Anything else passes through untouched.
   function maybeRewriteServe(repo, format, self, contentType, bytes, upstreamUrl) {
-    if (format === "npm" && String(contentType || "").includes("json")) {
+    const isJson = String(contentType || "").includes("json");
+    if (format === "npm" && isJson) {
       const r = rewriteNpmTarballs(repo, self, bytes);
       if (r.count) return { bytes: r.bytes, contentType, etag: sha256hex(r.bytes) };
     }
     if (format === "pypi" && String(contentType || "").includes("html")) {
       const r = rewritePypiHrefs(repo, self, upstreamUrl, bytes);
+      if (r.count) return { bytes: r.bytes, contentType, etag: sha256hex(r.bytes) };
+    }
+    if (format === "nuget" && isJson) {
+      const r = rewriteNugetUrls(repo, self, bytes);
       if (r.count) return { bytes: r.bytes, contentType, etag: sha256hex(r.bytes) };
     }
     return { bytes, contentType, etag: sha256hex(bytes) };

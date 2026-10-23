@@ -11,6 +11,8 @@
     "live:maven": "bun scripts/live-maven.js",
     "live:npm": "bun scripts/live-npm.js",
     "live:pypi": "bun scripts/live-pypi.js",
+    "live:go": "bun scripts/live-go.js",
+    "live:nuget": "bun scripts/live-nuget.js",
     "test": "bun scripts/smoke.js"
   },
   "dependencies": {

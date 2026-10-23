@@ -45,13 +45,24 @@ export function mapUpstream(repo, subpath) {
       else if (sub.endsWith(".module")) contentType = "application/json";
       else contentType = "application/octet-stream";
       break;
-    case "nuget":
-      contentType = sub.endsWith(".json") ? "application/json" : "application/octet-stream";
-      break;
-    case "go":
-      if (sub.endsWith(".info") || sub === "list" || sub === "@latest" || sub.endsWith("@latest"))
+    case "nuget": {
+      // upstream is the v3 service index; index.json → upstream, other paths
+      // (flat container, registration…) → same origin.
+      const origin = new URL(repo.upstream).origin;
+      if (!sub || sub === "index.json") {
+        url = /\.json$/i.test(repo.upstream) ? repo.upstream : `${base}/index.json`;
         contentType = "application/json";
+      } else {
+        url = `${origin}/${sub}`;
+        contentType = sub.endsWith(".json") ? "application/json" : "application/octet-stream";
+      }
+      break;
+    }
+    case "go":
+      if (sub.endsWith("/@v/list") || sub === "@v/list") contentType = "text/plain";
+      else if (sub.endsWith(".info") || sub.endsWith("@latest")) contentType = "application/json";
       else if (sub.endsWith(".mod")) contentType = "text/plain";
+      else if (sub.endsWith(".zip")) contentType = "application/zip";
       else contentType = "application/octet-stream";
       break;
     default:
@@ -116,6 +127,44 @@ export function rewritePypiHrefs(repo, self, upstreamUrl, bodyBytes) {
   if (!count) return { bytes: bodyBytes, count: 0 };
   return { bytes: new TextEncoder().encode(out), count };
 }
+
+/**
+ * Rewrite NuGet v3 URLs (service index, registration) from the upstream origin
+ * to this XAR repo, so `dotnet restore` downloads through the cache. Other hosts
+ * are untouched; RepositorySignatures stays HTTPS (NuGet rejects HTTP, NU1301).
+ * Cache keeps original bytes; rewrite happens on serve. Returns {bytes, count}.
+ */
+export function rewriteNugetUrls(repo, self, bodyBytes) {
+  const origin = new URL(repo.upstream).origin;
+  const selfRoot = `${String(self).replace(/\/+$/, "")}/nuget/${repo.name}/`;
+  const skip = /\/repository-signatures\//i;
+  let doc;
+  try {
+    doc = JSON.parse(new TextDecoder().decode(bodyBytes));
+  } catch {
+    return { bytes: bodyBytes, count: 0 };
+  }
+  let count = 0;
+  const walk = (v) => {
+    if (typeof v === "string") {
+      if (v.startsWith(`${origin}/`) && !skip.test(v)) {
+        count++;
+        return selfRoot + v.slice(origin.length + 1);
+      }
+      return v;
+    }
+    if (Array.isArray(v)) return v.map(walk);
+    if (v && typeof v === "object") {
+      for (const k of Object.keys(v)) v[k] = walk(v[k]);
+      return v;
+    }
+    return v;
+  };
+  const out = walk(doc);
+  if (!count) return { bytes: bodyBytes, count: 0 };
+  return { bytes: new TextEncoder().encode(JSON.stringify(out)), count };
+}
+
 /**
  * Rewrite npm `versions[].dist.tarball` to point at this XAR repo so
  * `npm install --registry <xar>/npm/<repo>` downloads tarballs through

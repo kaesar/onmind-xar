@@ -72,6 +72,56 @@ pip download --no-deps --index-url http://localhost:8791/pypi/pypiproxy/ \
   --trusted-host localhost six==1.16.0 -d /tmp/xar-pip
 ```
 
+## Go module proxy
+
+```bash
+curl -s -X POST http://localhost:8791/repositories \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"goproxy","format":"go","upstream":"https://proxy.golang.org"}'
+GOPROXY=http://localhost:8791/go/goproxy GOSUMDB=off go get rsc.io/quote@v1.5.2
+```
+
+Verified live (`bun run live:go`, real network vs `proxy.golang.org`):
+`list`/`@latest`/`.info`/`.mod`/`.zip` MISS→HIT, escaped uppercase module
+paths (`github.com/!burnt!sushi/toml`) pass through unchanged, missing
+module 404; `go get` e2e green (transitive deps included). `GOSUMDB=off`
+in the example avoids checksum-db egress; `/sumdb/…` paths are proxied
+too if used.
+
+## NuGet v3 feed
+
+```bash
+curl -s -X POST http://localhost:8791/repositories \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"nugetorg","format":"nuget","upstream":"https://api.nuget.org/v3/index.json"}'
+```
+
+`NuGet.Config` in the project (HTTP sources need `allowInsecureConnections`
+since NuGet 6.8):
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <packageSources>
+    <clear />
+    <add key="xar" value="http://localhost:8791/nuget/nugetorg/index.json" allowInsecureConnections="true" />
+  </packageSources>
+</configuration>
+```
+
+```bash
+dotnet add package Newtonsoft.Json --version 13.0.3
+dotnet build
+```
+
+Verified live (`bun run live:nuget`): service index MISS→HIT with
+`api.nuget.org` URLs rewritten to XAR, flat-container index, registration
+index, `.nupkg` MISS→HIT byte-identical, `.nuspec` passthrough, missing
+package 404; `dotnet add package` + `dotnet build` e2e green with a clean
+`NUGET_PACKAGES` cache. Repository-signature endpoints stay HTTPS (NuGet
+rejects HTTP signature URLs, NU1301); search endpoints hit nuget.org
+directly and are not cached in v1.
+
 ## Maven mirror (`~/.m2/settings.xml`)
 
 ```xml

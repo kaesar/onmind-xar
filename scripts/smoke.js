@@ -52,6 +52,48 @@ const fetchFn = async (url) => {
     const body = `payload-for:${url}`;
     return new Response(body, { status: 200, headers: { "Content-Type": "application/octet-stream" } });
   }
+  if (String(url).startsWith("https://proxy.golang.org/rsc.io/quote/@v/list")) {
+    return new Response("v1.5.1\nv1.5.2\n", { status: 200, headers: { "Content-Type": "text/plain" } });
+  }
+  if (String(url).startsWith("https://proxy.golang.org/rsc.io/quote/@v/") && url.endsWith(".info")) {
+    return new Response(JSON.stringify({ Version: "v1.5.2", Time: "2018-02-14T16:00:00Z" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+  if (String(url).startsWith("https://proxy.golang.org/rsc.io/quote/@v/") && url.endsWith(".mod")) {
+    return new Response("module rsc.io/quote\n\ngo 1.12\n", { status: 200, headers: { "Content-Type": "text/plain" } });
+  }
+  if (String(url).startsWith("https://proxy.golang.org/rsc.io/quote/@v/") && url.endsWith(".zip")) {
+    return new Response(`zip-payload:${url}`, { status: 200, headers: { "Content-Type": "application/zip" } });
+  }
+  if (String(url) === "https://api.nuget.org/v3/index.json") {
+    const index = {
+      version: "3.0.0",
+      resources: [
+        { "@id": "https://api.nuget.org/v3-flatcontainer/", "@type": "PackageBaseAddress/3.0.0" },
+        { "@id": "https://api.nuget.org/v3/registration5-gz-semver2/", "@type": "RegistrationsBaseUrl/3.6.0" },
+        { "@id": "https://api.nuget.org/v3-index/repository-signatures/5.0.0/index.json", "@type": "RepositorySignatures/5.0.0" },
+        { "@id": "https://azuresearch-usnc.nuget.org/query", "@type": "SearchQueryService" },
+      ],
+    };
+    return new Response(JSON.stringify(index), { status: 200, headers: { "Content-Type": "application/json" } });
+  }
+  if (String(url).startsWith("https://api.nuget.org/v3-flatcontainer/")) {
+    if (url.endsWith("/index.json")) {
+      return new Response(JSON.stringify({ versions: ["13.0.3"] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url.endsWith(".nuspec")) {
+      return new Response("<package><metadata><id>Newtonsoft.Json</id></metadata></package>", {
+        status: 200,
+        headers: { "Content-Type": "application/xml" },
+      });
+    }
+    return new Response(`nupkg-payload:${url}`, { status: 200, headers: { "Content-Type": "application/octet-stream" } });
+  }
   const body = `payload-for:${url}`;
   return new Response(body, { status: 200, headers: { "Content-Type": "application/octet-stream" } });
 };
@@ -216,6 +258,81 @@ const req = (path, init) => app.request(path, init);
   check("pypi file MISS passthrough", f1.status === 200 && f1.headers.get("x-xar-cache") === "MISS" && fb1.startsWith("payload-for:https://files.pythonhosted.org/"));
   const f2 = await req("/pypi/pypiorg/files/packages/aa/bb/six-1.16.0.tar.gz");
   check("pypi file HIT", f2.status === 200 && f2.headers.get("x-xar-cache") === "HIT");
+}
+
+// 9e go module proxy (GOPROXY protocol, escaped paths pass through)
+{
+  const mk = await req("/repositories", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "goproxy", format: "go", upstream: "https://proxy.golang.org" }),
+  });
+  check("POST go repo 201", mk.status === 201);
+  const l1 = await req("/go/goproxy/rsc.io/quote/@v/list");
+  const lt = await l1.text();
+  check(
+    "go list MISS + text/plain",
+    l1.status === 200 && l1.headers.get("x-xar-cache") === "MISS" && lt.includes("v1.5.2") && (l1.headers.get("content-type") || "").includes("text/plain"),
+    `status=${l1.status} ct=${l1.headers.get("content-type")}`
+  );
+  const l2 = await req("/go/goproxy/rsc.io/quote/@v/list");
+  check("go list HIT", l2.status === 200 && l2.headers.get("x-xar-cache") === "HIT");
+  const info = await req("/go/goproxy/rsc.io/quote/@v/v1.5.2.info");
+  const ij = await info.json();
+  check("go .info MISS + json", info.status === 200 && info.headers.get("x-xar-cache") === "MISS" && ij.Version === "v1.5.2", JSON.stringify(ij));
+  const mod = await req("/go/goproxy/rsc.io/quote/@v/v1.5.2.mod");
+  const mt = await mod.text();
+  check("go .mod MISS + plain", mod.status === 200 && mt.startsWith("module rsc.io/quote") && (mod.headers.get("content-type") || "").includes("text/plain"));
+  const z1 = await req("/go/goproxy/rsc.io/quote/@v/v1.5.2.zip");
+  const zb1 = await z1.text();
+  check("go .zip MISS + zip type", z1.status === 200 && z1.headers.get("x-xar-cache") === "MISS" && zb1.startsWith("zip-payload:") && (z1.headers.get("content-type") || "").includes("application/zip"));
+  const z2 = await req("/go/goproxy/rsc.io/quote/@v/v1.5.2.zip");
+  check("go .zip HIT", z2.status === 200 && z2.headers.get("x-xar-cache") === "HIT");
+}
+
+// 9f nuget v3 service index rewrite (dotnet restore must stay inside XAR)
+{
+  const mk = await req("/repositories", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "nugetorg", format: "nuget", upstream: "https://api.nuget.org/v3/index.json" }),
+  });
+  check("POST nuget repo 201", mk.status === 201);
+  const s1 = await req("/nuget/nugetorg/index.json");
+  const sj = await s1.json();
+  const flat = sj.resources.find((r) => r["@type"] === "PackageBaseAddress/3.0.0")?.["@id"] || "";
+  const search = sj.resources.find((r) => r["@type"] === "SearchQueryService")?.["@id"] || "";
+  const sig = sj.resources.find((r) => String(r["@type"]).startsWith("RepositorySignatures"))?.["@id"] || "";
+  check(
+    "nuget service index MISS + origin rewritten",
+    s1.status === 200 &&
+      s1.headers.get("x-xar-cache") === "MISS" &&
+      flat === "http://localhost/nuget/nugetorg/v3-flatcontainer/",
+    `flat=${flat}`
+  );
+  check(
+    "nuget repository-signatures stays HTTPS (NU1301)",
+    sig === "https://api.nuget.org/v3-index/repository-signatures/5.0.0/index.json",
+    sig
+  );
+  check("nuget search host untouched (not cached in v1)", search === "https://azuresearch-usnc.nuget.org/query", search);
+  const root = await req("/nuget/nugetorg");
+  const rootJ = await root.json();
+  check("nuget repo root serves service index", root.status === 200 && Array.isArray(rootJ.resources));
+  const etag1 = s1.headers.get("etag") || "";
+  const s2 = await req("/nuget/nugetorg/index.json");
+  check("nuget service index HIT stable ETag", s2.status === 200 && s2.headers.get("x-xar-cache") === "HIT" && s2.headers.get("etag") === etag1);
+  const fi = await req("/nuget/nugetorg/v3-flatcontainer/newtonsoft.json/index.json");
+  const fj = await fi.json();
+  check("nuget flat index MISS + versions", fi.status === 200 && fi.headers.get("x-xar-cache") === "MISS" && fj.versions.includes("13.0.3"), JSON.stringify(fj));
+  const p1 = await req("/nuget/nugetorg/v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg");
+  const pb1 = await p1.text();
+  check("nuget nupkg MISS passthrough", p1.status === 200 && p1.headers.get("x-xar-cache") === "MISS" && pb1.startsWith("nupkg-payload:"));
+  const p2 = await req("/nuget/nugetorg/v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg");
+  check("nuget nupkg HIT", p2.status === 200 && p2.headers.get("x-xar-cache") === "HIT");
+  const ns = await req("/nuget/nugetorg/v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.nuspec");
+  const nst = await ns.text();
+  check("nuget nuspec passthrough", ns.status === 200 && nst.includes("<package>"));
 }
 
 // 10 auth guard
