@@ -6,7 +6,8 @@ Same stack/philosophy as **XCR/XIN**: **Bun 1.4 + Hono 4** locally,
 
 - Local: **xpacks.json** (metadata, zero deps, XAR schema) + `files/` blobs.
 - Cloud: **DynamoDB** (`xrepos` + `xartifacts`, TTL `expiresAt`) + **S3** blobs.
-- No PostgreSQL. No ORM. No container-image repos (use **XCR** for OCI).
+- No PostgreSQL. No ORM. Container images (OCI) are **not** reimplemented:
+  they are served by **XCR** (`../xcr`) as a dependency at `/v2/*`.
 
 > Honest warning: v1 is read-through cache only, single-writer on json,
 > no background GC, no presigned direct upload, Lambda responses ~6 MB max.
@@ -16,17 +17,41 @@ Same stack/philosophy as **XCR/XIN**: **Bun 1.4 + Hono 4** locally,
 
 ```bash
 cp .env.example .env
-bun install
+bun install          # also installs onmind-xcr (file:../xcr) — Docker/OCI
 bun run dev
-curl -s http://localhost:8791/health
+curl -s http://localhost:8791/health      # {"docker":"filesystem",...}
 bun run smoke
 ```
 
-Docker:
+Docker (build context is the parent dir, which holds `xar/` and `xcr/`):
 
 ```bash
-docker build -t onmind-xar . && docker run -p 8791:8791 -v /srv/xar:/data onmind-xar
+docker build -f xar/Dockerfile -t onmind-xar ..
+docker run -p 8791:8791 -v /srv/xar:/data onmind-xar
 ```
+
+## Docker / OCI (`/v2/*` — delegated to XCR)
+
+XAR does not implement the OCI distribution spec: it mounts **OnMind-XCR**
+(`onmind-xcr`, `file:../xcr`) as a sub-app under `/v2/*`, so a single host
+serves both package caches and container images.
+
+```bash
+docker login localhost:8791              # password = XAR_API_KEY (any username)
+docker tag myimage:latest localhost:8791/demo/myimage:v1
+docker push localhost:8791/demo/myimage:v1
+docker pull localhost:8791/demo/myimage:v1
+curl -s http://localhost:8791/v2/_catalog
+```
+
+- `XAR_DOCKER=on|off` (default `on`): with `off`, or when `onmind-xcr` is not
+  installed, `/v2/*` answers `404` with a hint; nothing else changes.
+- Images use XCR's own storage: `XCR_STORAGE=filesystem` + `XCR_DATA_DIR`
+  (default `./xcr-data`) or `XCR_STORAGE=s3` + `XCR_S3_*`. XAR metadata
+  (DynamoDB/S3) is untouched by image traffic.
+- Auth stays XAR's: `x-api-key`, or HTTP Basic with the key as password
+  (`docker login`). Unauthenticated `/v2/*` → `401` + `WWW-Authenticate: Basic`.
+- ECR JSON subset comes along with XCR (same routes, same port).
 
 ## Repos + proxy
 
@@ -153,21 +178,24 @@ is green; full `mvn dependency:get` pending a machine with Maven installed.
 
 | Method | Route | Notes |
 |---|---|---|
-| `GET` | `/health` | `{ok, env, storage, blob}` — always open |
+| `GET` | `/health` | `{ok, env, storage, blob, docker}` — always open |
 | `POST` | `/repositories` | `{name, format, upstream, cacheTtl?}` → `201`, dup `409` |
 | `GET` | `/repositories?n=&last=` | list |
 | `GET` | `/repositories/:name` | detail |
 | `DELETE` | `/repositories/:name` | `204` |
 | `GET` | `/npm/:repo/*`, `/pypi/:repo/*`, `/maven/:repo/*`, `/nuget/:repo/*`, `/go/:repo/*` | pull-through cache, `X-XAR-Cache: HIT\|MISS`, `ETag` |
 | `HEAD` | same proxy paths | metadata only (empty body), fills cache on MISS — Maven Wagon uses it |
+| `GET\|HEAD\|PUT\|PATCH\|POST\|DELETE` | `/v2/*` | Docker Registry V2 + ECR subset, delegated to OnMind-XCR |
 
-Auth: `x-api-key` header if `XAR_API_KEY` set (except `/health`).
+Auth: `x-api-key` header if `XAR_API_KEY` set (except `/health`); `/v2/*`
+also accepts HTTP Basic with the key as password (`docker login`).
 
 ## Configuration
 
 See `.env.example`. Local defaults: `XAR_STORAGE=json`, `XAR_JSON_PATH=./xpacks.json`,
-`XAR_BLOB=files`, `XAR_DATA_DIR=./files`. Cloud: `XAR_STORAGE=dynamodb` +
-`XAR_TABLE_REPOS/XAR_TABLE_ARTIFACTS`, `XAR_BLOB=s3` + `XAR_S3_BUCKET`.
+`XAR_BLOB=files`, `XAR_DATA_DIR=./files`, `XAR_DOCKER=on`, `XCR_DATA_DIR=./xcr-data`.
+Cloud: `XAR_STORAGE=dynamodb` + `XAR_TABLE_REPOS/XAR_TABLE_ARTIFACTS`,
+`XAR_BLOB=s3` + `XAR_S3_BUCKET`, and for images `XCR_STORAGE=s3` + `XCR_S3_BUCKET`.
 
 ## Deploy
 
@@ -183,4 +211,5 @@ npx cdk deploy
 
 ```bash
 bun run smoke
+bun run live:docker   # OCI push/pull through /v2 (XCR sub-app) + docker CLI if installed
 ```

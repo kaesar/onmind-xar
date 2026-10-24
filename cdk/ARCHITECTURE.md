@@ -3,6 +3,12 @@
 `cdk/` deploys: Lambda (Hono) + DynamoDB (`xrepos`, `xartifacts` with TTL
 on `expiresAt`) + S3 (blobs) + HTTP API Gateway v2.
 
+Docker/OCI: the same Lambda mounts OnMind-XCR at `/v2/*` (dependency, see
+`src/docker.js`). On Lambda that needs XCR's S3 backend, so set
+`XAR_DOCKER=on`, `XCR_STORAGE=s3` and `XCR_S3_BUCKET` (the stack ships XCR
+inside the asset; point `XCR_S3_PREFIX` to a separate prefix). With
+`XAR_DOCKER=off` the function is packages-only and needs nothing extra.
+
 ```
 clients (npm/pip/mvn/nuget/go)
   → HTTP API (ANY /{proxy+})

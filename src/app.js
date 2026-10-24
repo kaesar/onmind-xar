@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { storageFromEnv, validateRepoInput } from "./storage.js";
 import { blobsFromEnv } from "./blobs.js";
+import { dockerEnabled } from "./docker.js";
 import { mapUpstream, rewriteNpmTarballs, rewriteNugetUrls, rewritePypiHrefs, selfBaseUrl } from "./formats.js";
 import { fetchUpstream } from "./upstream.js";
 import { nowIso, sha256hex, ttlSec, parseN } from "./ids.js";
@@ -11,6 +12,7 @@ export function createApp(env = process.env, deps = null) {
   const repos = deps?.repos ?? storageFromEnv(env);
   const blobs = deps?.blobs ?? blobsFromEnv(env);
   const fetchFn = deps?.fetchFn ?? fetch;
+  const docker = deps?.docker ?? null; // XCR app mounted at /v2 (see docker.js)
   const API_KEY = env.XAR_API_KEY || "";
 
   const origins = (env.XAR_CORS_ORIGINS || "*").split(",").map((s) => s.trim()).filter(Boolean);
@@ -22,7 +24,28 @@ export function createApp(env = process.env, deps = null) {
     return c.json({ message: "Internal error" }, 500);
   });
 
-  app.get("/health", (c) => c.json({ ok: true, env: env.XAR_ENV || "dev", storage: repos.mode, blob: blobs.mode }));
+  app.get("/health", (c) =>
+    c.json({
+      ok: true,
+      env: env.XAR_ENV || "dev",
+      storage: repos.mode,
+      blob: blobs.mode,
+      docker: docker ? docker.mode : "off",
+    })
+  );
+
+  // ---- Container images: delegate to OnMind-XCR (dependency) ----
+  // XCR serves /v2/* (Docker Registry V2 + ECR subset) with its own storage;
+  // mount it before the proxy routes so docker clients talk to one host.
+  if (docker?.fetch) {
+    const xcrFetch = docker.fetch.bind(docker);
+    app.all("/v2/*", (c) => xcrFetch(c.req.raw, { ...process.env }));
+  } else {
+    app.all("/v2/*", (c) => {
+      const hint = dockerEnabled(env) ? "OnMind-XCR not installed" : "disabled (XAR_DOCKER=off)";
+      return c.json({ errors: [{ code: "UNSUPPORTED", message: `Docker registry ${hint}` }] }, 404);
+    });
+  }
 
   // ---- Admin: repositories ----
   app.get("/repositories", async (c) => {
@@ -183,7 +206,26 @@ function apiKeyGuard(apiKey) {
     if (!apiKey) return next();
     if (c.req.path === "/health") return next();
     const got = c.req.header("x-api-key") || "";
-    if (got !== apiKey) return c.json({ message: "Forbidden" }, 403);
+    if (got !== apiKey) {
+      // Docker login uses Basic; the password is the same key.
+      const auth = c.req.header("authorization") || "";
+      let basicOk = false;
+      if (auth.startsWith("Basic ")) {
+        try {
+          const decoded = atob(auth.slice(6).trim());
+          basicOk = decoded.slice(decoded.indexOf(":") + 1) === apiKey;
+        } catch {
+          basicOk = false;
+        }
+      }
+      if (!basicOk) {
+        if (c.req.path.startsWith("/v2/")) {
+          c.header("WWW-Authenticate", 'Basic realm="xar"');
+          return c.json({ errors: [{ code: "UNAUTHORIZED", message: "Authentication required" }] }, 401);
+        }
+        return c.json({ message: "Forbidden" }, 403);
+      }
+    }
     return next();
   };
 }

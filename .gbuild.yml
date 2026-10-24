@@ -1,0 +1,8 @@
+workspace:
+  base: /app
+  uuid: 2b4e1c9a-6d1f-4f3e-9a57-0f9d1c2b7e10
+  projects:
+    xcr: {}
+    xar:
+      depends:
+        - xcr

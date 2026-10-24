@@ -15,6 +15,7 @@
 //   tablePrefix      prepended to xrepos/xartifacts/bucket (multi-env accounts)
 //   xarEnv           XAR_ENV for the app (default production)
 //   corsOrigins      comma list → XAR_CORS_ORIGINS
+//   docker           true (default) | false — mount OnMind-XCR at /v2/* (OCI)
 //   localEndpoint    emulator URL → AWS_ENDPOINT_URL + XAR_DYNAMO_ENDPOINT + XAR_S3_ENDPOINT
 'use strict'
 const path = require('node:path')
@@ -111,6 +112,18 @@ class XarStack extends cdk.Stack {
       fnEnv.AWS_ENDPOINT_URL = localEndpoint
       fnEnv.XAR_DYNAMO_ENDPOINT = localEndpoint
       fnEnv.XAR_S3_ENDPOINT = localEndpoint
+    }
+
+    // ---------- Docker/OCI: OnMind-XCR as a dependency (/v2/*) ----------
+    // docker=false → packages-only; true (default) → XCR mounted, images in
+    // the same bucket under its own prefix (XCR_STORAGE=s3).
+    const dockerOff = !ctxBool(this, 'docker', true)
+    fnEnv.XAR_DOCKER = dockerOff ? 'off' : 'on'
+    if (!dockerOff) {
+      fnEnv.XCR_STORAGE = 's3'
+      fnEnv.XCR_S3_BUCKET = bucket.bucketName
+      fnEnv.XCR_S3_PREFIX = 'docker-registry/'
+      if (localEndpoint) fnEnv.XCR_S3_ENDPOINT = localEndpoint
     }
 
     // ---------- Lambda ----------

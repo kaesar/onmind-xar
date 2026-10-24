@@ -378,12 +378,74 @@ const req = (path, init) => app.request(path, init);
   check("json file persists repo", !!got && got.format === "npm");
 }
 
-// 13 delete
+// 13 delete (runs before the docker block below: that app reuses this store)
 {
   const r = await req("/repositories/npmjs", { method: "DELETE" });
   check("DELETE repo 204", r.status === 204);
   const g = await req("/repositories/npmjs");
   check("GET deleted 404", g.status === 404);
+}
+
+// 14 docker/OCI: XCR mounted as a dependency at /v2 (stub; live check is
+// scripts/live-docker.js against the real ../xcr).
+{
+  const seen = [];
+  const xcrStub = {
+    mode: "stub",
+    async fetch(request) {
+      const p = new URL(request.url).pathname;
+      seen.push(`${request.method} ${p}`);
+      if (p === "/v2/") {
+        return new Response(JSON.stringify({ ok: "xcr" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json", "Docker-Distribution-Api-Version": "registry/2.0" },
+        });
+      }
+      return new Response(JSON.stringify({ errors: [{ code: "NAME_UNKNOWN" }] }), { status: 404 });
+    },
+  };
+  const app = createApp({ XAR_ENV: "dev" }, { repos, blobs, docker: xcrStub });
+  const h = await app.request("/health");
+  const hj = await h.json();
+  check("health reports docker mode", hj.docker === "stub", JSON.stringify(hj));
+  const v2 = await app.request("/v2/");
+  check(
+    "docker /v2/ delegated to XCR",
+    v2.status === 200 && v2.headers.get("docker-distribution-api-version") === "registry/2.0",
+    `status=${v2.status}`
+  );
+
+  // PUT goes through untouched (pushes are not limited to GET/HEAD).
+  const put = await app.request("/v2/demo/hello/manifests/v1", {
+    method: "PUT",
+    headers: { "Content-Type": "application/vnd.oci.image.manifest.v1+json" },
+    body: "{}",
+  });
+  check("docker PUT reaches XCR", put.status === 404 && seen.includes("PUT /v2/demo/hello/manifests/v1"), seen.join(","));
+
+  // Disabled: 404 with hint, no dependency loaded.
+  const off = createApp({ XAR_ENV: "dev", XAR_DOCKER: "off" }, { repos, blobs, docker: null });
+  const offV2 = await off.request("/v2/");
+  const offJ = await offV2.json();
+  check(
+    "docker off → 404 hint",
+    offV2.status === 404 && String(offJ.errors?.[0]?.message || "").includes("XAR_DOCKER=off"),
+    JSON.stringify(offJ)
+  );
+
+  // Docker login: Basic password = XAR_API_KEY; unauthenticated /v2 → 401 + challenge.
+  const authed = createApp({ XAR_ENV: "dev", XAR_API_KEY: "k" }, { repos, blobs, docker: xcrStub });
+  const noAuth = await authed.request("/v2/");
+  const basic = await authed.request("/v2/", { headers: { Authorization: `Basic ${btoa("docker:k")}` } });
+  check(
+    "docker auth 401 + Basic login",
+    noAuth.status === 401 &&
+      (noAuth.headers.get("www-authenticate") || "").startsWith("Basic ") &&
+      basic.status === 200,
+    `noAuth=${noAuth.status} basic=${basic.status}`
+  );
+  const wrong = await authed.request("/v2/", { headers: { Authorization: `Basic ${btoa("docker:nope")}` } });
+  check("docker auth wrong password 401", wrong.status === 401, `status=${wrong.status}`);
 }
 
 await rm(dir, { recursive: true, force: true });

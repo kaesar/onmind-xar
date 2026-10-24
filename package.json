@@ -13,11 +13,13 @@
     "live:pypi": "bun scripts/live-pypi.js",
     "live:go": "bun scripts/live-go.js",
     "live:nuget": "bun scripts/live-nuget.js",
+    "live:docker": "bun scripts/live-docker.js",
     "test": "bun scripts/smoke.js"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.637.0",
     "@aws-sdk/client-s3": "^3.637.0",
-    "hono": "^4.7.0"
+    "hono": "^4.7.0",
+    "onmind-xcr": "file:../xcr"
   }
 }
