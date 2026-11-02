@@ -133,6 +133,22 @@ function jsonStorage(path) {
         return entry;
       });
     },
+    async listArtifacts({ repo = "", n = 100, last = "" } = {}) {
+      const doc = await readAll();
+      const prefix = repo ? `${repo}:` : "";
+      const now = Math.floor(Date.now() / 1000);
+      const keys = Object.keys(doc.artifacts)
+        .filter((k) => k.startsWith(prefix))
+        .sort();
+      const start = last ? keys.findIndex((k) => k > last) : 0;
+      const from = start < 0 ? keys.length : start;
+      const slice = keys.slice(from, from + n);
+      const items = slice
+        .map((k) => doc.artifacts[k])
+        .filter((a) => a && (!a.expiresAt || a.expiresAt >= now));
+      const next = from + slice.length < keys.length ? slice[slice.length - 1] : "";
+      return { items, next };
+    },
   };
 }
 
@@ -237,6 +253,32 @@ function dynamoStorage(env) {
         })
       );
       return entry;
+    },
+    async listArtifacts({ repo = "", n = 100, last = "" } = {}) {
+      const { ScanCommand } = await import("@aws-sdk/client-dynamodb");
+      const db = await client();
+      const prefix = repo ? `${repo}:` : "";
+      const params = { TableName: artifactsTable };
+      if (prefix) {
+        params.FilterExpression = "begins_with(#key, :prefix)";
+        params.ExpressionAttributeNames = { "#key": "key" };
+        params.ExpressionAttributeValues = { ":prefix": { S: prefix } };
+      }
+      const out = await db.send(new ScanCommand(params));
+      const now = Math.floor(Date.now() / 1000);
+      const items = (out.Items || [])
+        .map((item) => {
+          try {
+            return JSON.parse(item.data.S);
+          } catch {
+            return null;
+          }
+        })
+        .filter((a) => a && (!a.expiresAt || a.expiresAt >= now) && (!last || a.key > last) && a.key.startsWith(prefix))
+        .sort((a, b) => a.key.localeCompare(b.key));
+      const slice = items.slice(0, n);
+      const next = items.length > slice.length ? slice[slice.length - 1].key : "";
+      return { items: slice, next };
     },
   };
 }

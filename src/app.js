@@ -83,6 +83,29 @@ export function createApp(env = process.env, deps = null) {
     return c.body(null, 204);
   });
 
+  // ---- Admin: cached artifacts (metadata only, no blobs) ----
+  app.get("/artifacts", async (c) => {
+    try {
+      const n = parseN(c.req.query("n"), 100);
+      const last = c.req.query("last") || "";
+      const repo = c.req.query("repo") || "";
+      const { items, next } = await repos.listArtifacts({ repo, n, last });
+      const formats = new Map();
+      const artifacts = [];
+      for (const item of items) {
+        let format = item.format || "";
+        if (!format && item.repo) {
+          if (!formats.has(item.repo)) formats.set(item.repo, await repos.getRepo(item.repo));
+          format = formats.get(item.repo)?.format || "";
+        }
+        artifacts.push({ ...item, format });
+      }
+      return c.json({ artifacts, count: artifacts.length, ...(next ? { last: next } : {}) });
+    } catch (e) {
+      return c.json({ message: e.message || "Bad request" }, e.status || 400);
+    }
+  });
+
   // ---- Proxy-cache per format (GET downloads, HEAD metadata — Maven Wagon uses both) ----
   for (const prefix of ["npm", "pypi", "maven", "nuget", "go"]) {
     app.on(["GET", "HEAD"], `/${prefix}/:repo/*`, (c) => handleProxy(c, prefix));
@@ -144,6 +167,7 @@ export function createApp(env = process.env, deps = null) {
     const entry = {
       key,
       repo: repoName,
+      format: repo.format,
       path: subpath,
       etag,
       size,

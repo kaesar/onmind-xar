@@ -181,6 +181,7 @@ is green; full `mvn dependency:get` pending a machine with Maven installed.
 | `GET` | `/health` | `{ok, env, storage, blob, docker}` — always open |
 | `POST` | `/repositories` | `{name, format, upstream, cacheTtl?}` → `201`, dup `409` |
 | `GET` | `/repositories?n=&last=` | list |
+| `GET` | `/artifacts?repo=&n=&last=` | cached artifacts metadata (no blobs) |
 | `GET` | `/repositories/:name` | detail |
 | `DELETE` | `/repositories/:name` | `204` |
 | `GET` | `/npm/:repo/*`, `/pypi/:repo/*`, `/maven/:repo/*`, `/nuget/:repo/*`, `/go/:repo/*` | pull-through cache, `X-XAR-Cache: HIT\|MISS`, `ETag` |

@@ -448,6 +448,38 @@ const req = (path, init) => app.request(path, init);
   check("docker auth wrong password 401", wrong.status === 401, `status=${wrong.status}`);
 }
 
+// ---- cached artifacts listing ----
+{
+  const r = await req("/artifacts");
+  const j = await r.json();
+  check(
+    "GET /artifacts lists cached metadata",
+    r.status === 200 &&
+      j.artifacts?.length > 0 &&
+      j.artifacts.every((a) => a.key && a.repo && a.path && !("bytes" in a)),
+    JSON.stringify(j).slice(0, 160)
+  );
+  check(
+    "GET /artifacts entries carry format",
+    j.artifacts.length > 0 && j.artifacts.every((a) => typeof a.format === "string" && a.format.length > 0),
+    JSON.stringify(j.artifacts.slice(0, 2))
+  );
+  const filtered = await (await req("/artifacts?repo=npmjs")).json();
+  check("GET /artifacts?repo filters", filtered.artifacts?.every((a) => a.repo === "npmjs"), "");
+  const empty = await (await req("/artifacts?repo=missing")).json();
+  check("GET /artifacts unknown repo empty", empty.count === 0, JSON.stringify(empty));
+  const page = await (await req("/artifacts?n=1")).json();
+  check(
+    "GET /artifacts pagination",
+    page.count === 1 && typeof page.last === "string" && page.last.length > 0,
+    JSON.stringify(page).slice(0, 120)
+  );
+  if (page.last) {
+    const nextPage = await (await req(`/artifacts?n=1&last=${encodeURIComponent(page.last)}`)).json();
+    check("GET /artifacts next page advances", nextPage.artifacts?.[0]?.key > page.last, "");
+  }
+}
+
 await rm(dir, { recursive: true, force: true });
 
 console.log(`\n${pass} pass, ${fail} fail`);
