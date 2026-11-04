@@ -14,6 +14,12 @@ export function createApp(env = process.env, deps = null) {
   const fetchFn = deps?.fetchFn ?? fetch;
   const docker = deps?.docker ?? null; // XCR app mounted at /v2 (see docker.js)
   const API_KEY = env.XAR_API_KEY || "";
+  // Binary downloads can be served as a 307 to a presigned S3 URL, which keeps
+  // Lambda responses small. Files mode has no presign, and rewritten metadata
+  // (npm/pypi/nuget) must still be produced by this process.
+  const presignEnabled =
+    typeof blobs.presign === "function" &&
+    !/^(off|0|false|no)$/i.test(String(env.XAR_PRESIGN_DOWNLOAD || "on"));
 
   const origins = (env.XAR_CORS_ORIGINS || "*").split(",").map((s) => s.trim()).filter(Boolean);
   app.use("*", cors({ origin: origins.includes("*") ? "*" : origins }));
@@ -135,11 +141,31 @@ export function createApp(env = process.env, deps = null) {
       const self = selfBaseUrl(c);
       const cached = await repos.getArtifact(key);
       if (cached?.etag) {
-        const blob = await blobs.get(cached.etag);
-        if (blob) {
-          const out = maybeRewriteServe(repo, expectedFormat, self, cached.contentType || contentType, blob.bytes, url);
-          if (headOnly) return serveHead(c, out.contentType, out.etag, out.bytes.byteLength, true);
-          return serveBytes(c, out.bytes, out.contentType, out.etag, true);
+        const cachedType = cached.contentType || contentType;
+        const rewrite = needsRewrite(expectedFormat, cachedType);
+        if (headOnly) {
+          // Metadata-only: no need to pull the blob bytes from storage.
+          if (!rewrite && cached.size != null) {
+            return serveHead(c, cachedType, cached.etag, cached.size, true);
+          }
+          const blob = await blobs.get(cached.etag);
+          if (blob) {
+            const out = maybeRewriteServe(repo, expectedFormat, self, cachedType, blob.bytes, url);
+            return serveHead(c, out.contentType, out.etag, out.bytes.byteLength, true);
+          }
+        } else {
+          if (!rewrite && presignEnabled) {
+            const signed = await blobs.presign(cached.etag, {
+              contentType: cachedType,
+              filename: fileNameOf(subpath),
+            });
+            return serveRedirect(c, signed, true);
+          }
+          const blob = await blobs.get(cached.etag);
+          if (blob) {
+            const out = maybeRewriteServe(repo, expectedFormat, self, cachedType, blob.bytes, url);
+            return serveBytes(c, out.bytes, out.contentType, out.etag, true);
+          }
         }
       }
       if (headOnly) {
@@ -155,6 +181,14 @@ export function createApp(env = process.env, deps = null) {
       if (up.status === 404 || up.status === 410 || !up.bytes) return c.json({ message: "Not found upstream" }, 404);
       if (up.status !== 200) return c.json({ message: `Upstream error (${up.status})` }, 502);
       const stored = await storeArtifact(repo, repoName, key, subpath, url, up);
+      if (!needsRewrite(expectedFormat, stored.contentType) && presignEnabled) {
+        // Bytes were needed once to hash/upload the blob; clients then go direct.
+        const signed = await blobs.presign(stored.etag, {
+          contentType: stored.contentType,
+          filename: fileNameOf(subpath),
+        });
+        return serveRedirect(c, signed, false);
+      }
       const out = maybeRewriteServe(repo, expectedFormat, self, stored.contentType, up.bytes, url);
       return serveBytes(c, out.bytes, out.contentType, out.etag, false);
     } catch (e) {
@@ -186,7 +220,23 @@ export function createApp(env = process.env, deps = null) {
   // - pypi simple HTML: file hrefs → this instance (files/ reserved subpath)
   // - nuget v3 JSON: service-index/registration URLs → this instance
   // Anything else passes through untouched.
+  function needsRewrite(format, contentType) {
+    const type = String(contentType || "").toLowerCase();
+    if (format === "npm" && type.includes("json")) return true;
+    if (format === "pypi" && type.includes("html")) return true;
+    if (format === "nuget" && type.includes("json")) return true;
+    return false;
+  }
+
+  function fileNameOf(subpath) {
+    const parts = String(subpath || "").split("/");
+    return parts[parts.length - 1] || "artifact";
+  }
+
   function maybeRewriteServe(repo, format, self, contentType, bytes, upstreamUrl) {
+    if (!needsRewrite(format, contentType)) {
+      return { bytes, contentType, etag: sha256hex(bytes) };
+    }
     const isJson = String(contentType || "").includes("json");
     if (format === "npm" && isJson) {
       const r = rewriteNpmTarballs(repo, self, bytes);
@@ -201,6 +251,12 @@ export function createApp(env = process.env, deps = null) {
       if (r.count) return { bytes: r.bytes, contentType, etag: sha256hex(r.bytes) };
     }
     return { bytes, contentType, etag: sha256hex(bytes) };
+  }
+
+  function serveRedirect(c, url, hit) {
+    c.header("Cache-Control", "no-store");
+    c.header("X-XAR-Cache", hit ? "HIT" : "MISS");
+    return c.redirect(url, 307);
   }
 
   function serveHead(c, contentType, etag, size, hit) {

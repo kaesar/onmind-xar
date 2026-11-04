@@ -43,6 +43,7 @@ function s3Blobs(env) {
   const prefix = env.XAR_S3_PREFIX || "artifacts/";
   const endpoint = env.XAR_S3_ENDPOINT || undefined;
   const region = env.XAR_S3_REGION || env.AWS_REGION || "us-east-1";
+  const presignTtl = Math.max(30, Number(env.XAR_PRESIGN_TTL || 300));
   if (!bucket) throw new Error("xar: s3 blob mode requires XAR_S3_BUCKET");
   const keyFor = (hex) => `${prefix}sha256/${hex.slice(0, 2)}/${hex}`;
   let clientPromise = null;
@@ -82,6 +83,22 @@ function s3Blobs(env) {
         if (e.name === "NoSuchKey" || e.$metadata?.httpStatusCode === 404) return null;
         throw e;
       }
+    },
+    // Direct browser/CLI download: the S3 host must be reachable by clients
+    // (public bucket endpoint or a proxy in front of it).
+    async presign(hex, { contentType, filename, expiresIn } = {}) {
+      const { GetObjectCommand } = await import("@aws-sdk/client-s3");
+      const { getSignedUrl } = await import("@aws-sdk/s3-request-presigner");
+      const db = await client();
+      const command = new GetObjectCommand({
+        Bucket: bucket,
+        Key: keyFor(hex),
+        ...(contentType ? { ResponseContentType: contentType } : {}),
+        ...(filename
+          ? { ResponseContentDisposition: `attachment; filename="${String(filename).replace(/"/g, "")}"` }
+          : {}),
+      });
+      return getSignedUrl(db, command, { expiresIn: Math.max(30, Number(expiresIn) || presignTtl) });
     },
   };
 }

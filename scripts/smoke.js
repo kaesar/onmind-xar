@@ -480,6 +480,64 @@ const req = (path, init) => app.request(path, init);
   }
 }
 
+// ---- presigned downloads (307) ----
+{
+  const signed = [];
+  const presignBlobs = {
+    ...blobs,
+    async presign(hex, opts = {}) {
+      signed.push({ hex, opts });
+      return `https://s3.test/xar/${hex}?sig=1`;
+    },
+  };
+  const presignApp = createApp({ XAR_ENV: "dev" }, { repos, blobs: presignBlobs, fetchFn });
+
+  await presignApp.request("/repositories", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "presign", format: "npm", upstream: "https://registry.npmjs.org" }),
+  });
+
+  const miss = await presignApp.request("/npm/presign/-/file.tgz");
+  check(
+    "first GET stores then redirects (MISS)",
+    miss.status === 307 && miss.headers.get("x-xar-cache") === "MISS" && !!miss.headers.get("location"),
+    `${miss.status} ${miss.headers.get("x-xar-cache")}`
+  );
+  check(
+    "presign receives content type and filename",
+    signed[0]?.opts?.contentType === "application/octet-stream" && signed[0]?.opts?.filename === "file.tgz",
+    JSON.stringify(signed[0]?.opts)
+  );
+
+  const hit = await presignApp.request("/npm/presign/-/file.tgz");
+  check(
+    "cached blob GET redirects to presigned URL",
+    hit.status === 307 &&
+      hit.headers.get("x-xar-cache") === "HIT" &&
+      hit.headers.get("location") === `https://s3.test/xar/${signed[0]?.hex}?sig=1`,
+    `${hit.status} ${hit.headers.get("location")}`
+  );
+
+  const head = await presignApp.request("/npm/presign/-/file.tgz", { method: "HEAD" });
+  check(
+    "HEAD answers metadata without redirect",
+    head.status === 200 && !head.headers.get("location") && Number(head.headers.get("content-length")) > 0,
+    `${head.status} ${head.headers.get("content-length")}`
+  );
+
+  // Rewritten metadata must never redirect: the bytes differ from the blob.
+  const meta = await presignApp.request("/npm/presign/express-meta");
+  check("rewritten metadata is served inline", meta.status === 200 && (await meta.text()).includes("localhost"));
+
+  const off = createApp(
+    { XAR_ENV: "dev", XAR_PRESIGN_DOWNLOAD: "off" },
+    { repos, blobs: presignBlobs, fetchFn }
+  );
+  const inline = await off.request("/npm/presign/-/other.tgz");
+  check("XAR_PRESIGN_DOWNLOAD=off disables redirects", inline.status === 200, `status=${inline.status}`);
+}
+
 await rm(dir, { recursive: true, force: true });
 
 console.log(`\n${pass} pass, ${fail} fail`);

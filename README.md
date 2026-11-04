@@ -10,7 +10,8 @@ Same stack/philosophy as **XCR/XIN**: **Bun 1.4 + Hono 4** locally,
   they are served by **XCR** (`../xcr`) as a dependency at `/v2/*`.
 
 > Honest warning: v1 is read-through cache only, single-writer on json,
-> no background GC, no presigned direct upload, Lambda responses ~6 MB max.
+> no background GC, no presigned direct upload, Lambda responses ~6 MB max
+> (cached S3 downloads redirect instead: see *API*).
 > Suitable for labs/CI and low-risk registries.
 
 ## Quickstart
@@ -186,6 +187,13 @@ is green; full `mvn dependency:get` pending a machine with Maven installed.
 | `DELETE` | `/repositories/:name` | `204` |
 | `GET` | `/npm/:repo/*`, `/pypi/:repo/*`, `/maven/:repo/*`, `/nuget/:repo/*`, `/go/:repo/*` | pull-through cache, `X-XAR-Cache: HIT\|MISS`, `ETag` |
 | `HEAD` | same proxy paths | metadata only (empty body), fills cache on MISS — Maven Wagon uses it |
+
+With `XAR_BLOB=s3`, cached binary downloads answer `307` with a presigned S3
+URL instead of streaming the bytes, so Lambda's ~6 MB response limit no longer
+applies. `HEAD` keeps returning metadata, and rewritten metadata (npm/pypi/nuget
+JSON or HTML) is always served by XAR. Disable with `XAR_PRESIGN_DOWNLOAD=off`;
+the link lifetime is `XAR_PRESIGN_TTL` (default 300 s). Clients must be able to
+reach the S3 endpoint (public bucket endpoint or a proxy).
 | `GET\|HEAD\|PUT\|PATCH\|POST\|DELETE` | `/v2/*` | Docker Registry V2 + ECR subset, delegated to OnMind-XCR |
 
 Auth: `x-api-key` header if `XAR_API_KEY` set (except `/health`); `/v2/*`
@@ -197,6 +205,8 @@ See `.env.example`. Local defaults: `XAR_STORAGE=json`, `XAR_JSON_PATH=./xpacks.
 `XAR_BLOB=files`, `XAR_DATA_DIR=./files`, `XAR_DOCKER=on`, `XCR_DATA_DIR=./xcr-data`.
 Cloud: `XAR_STORAGE=dynamodb` + `XAR_TABLE_REPOS/XAR_TABLE_ARTIFACTS`,
 `XAR_BLOB=s3` + `XAR_S3_BUCKET`, and for images `XCR_STORAGE=s3` + `XCR_S3_BUCKET`.
+Presigned downloads: `XAR_PRESIGN_DOWNLOAD=on|off` (default `on` for S3),
+`XAR_PRESIGN_TTL=300`.
 
 ## Deploy
 
